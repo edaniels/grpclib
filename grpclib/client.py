@@ -451,6 +451,7 @@ class Stream(StreamIterator[_RecvType], Generic[_SendType, _RecvType]):
         by using :py:attr:`trailing_metadata` attribute.
         """
         if (not self._end_done  # explicit end
+            and not self._cardinality.server_streaming
             and not (not self._cardinality.client_streaming  # implicit end
                      and self._send_message_done)):
             raise ProtocolError('Outgoing stream was not ended')
