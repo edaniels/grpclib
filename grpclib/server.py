@@ -84,6 +84,7 @@ class Stream(StreamIterator[_RecvType], Generic[_RecvType, _SendType]):
         dispatch: _DispatchServerEvents,
         deadline: Optional[Deadline] = None,
         user_agent: Optional[str] = None,
+        close_event: Optional[asyncio.Event] = None,
     ):
         self._stream = stream
         self._method_name = method_name
@@ -102,6 +103,8 @@ class Stream(StreamIterator[_RecvType], Generic[_RecvType, _SendType]):
         self.user_agent = user_agent
         #: Connection's peer info of type :py:class:`~grpclib.protocol.Peer`
         self.peer = self._stream.connection.get_peer()
+        # detect server closing via event
+        self.close_event = close_event
 
     @property
     def _content_type(self) -> str:
@@ -314,6 +317,13 @@ class Stream(StreamIterator[_RecvType], Generic[_RecvType, _SendType]):
                 status = Status.UNKNOWN
                 status_message = 'Internal Server Error'
                 status_details = None
+            elif isinstance(exc_val, asyncio.CancelledError):
+                status = Status.CANCELLED
+                if self.close_event is not None and self.close_event.is_set():
+                    status_message = 'Canceled (Server Closing)'
+                else:
+                    status_message = 'Canceled'
+                status_details = None
             else:
                 # propagate exception
                 return None
@@ -373,6 +383,7 @@ async def request_handler(
     status_details_codec: Optional[StatusDetailsCodecBase],
     dispatch: _DispatchServerEvents,
     release_stream: Callable[[], Any],
+    close_event: Optional[asyncio.Event] = None,
 ) -> None:
     try:
         headers_map = dict(headers)
@@ -424,6 +435,7 @@ async def request_handler(
             method.request_type, method.reply_type,
             codec=codec, status_details_codec=status_details_codec,
             dispatch=dispatch, deadline=deadline, user_agent=user_agent,
+            close_event=close_event,
         ) as stream:
             deadline_wrapper: 'ContextManager[Any]'
             if deadline is None:
@@ -497,6 +509,7 @@ class Handler(_GC, AbstractHandler):
     __gc_interval__ = 10
 
     closing = False
+    close_event = asyncio.Event()
 
     def __init__(
         self,
@@ -525,22 +538,30 @@ class Handler(_GC, AbstractHandler):
         headers: _Headers,
         release_stream: Callable[[], Any],
     ) -> None:
+        if self.closing:
+            stream.reset_nowait()
+            return
         self.__gc_step__()
-        self._tasks[stream] = self.loop.create_task(request_handler(
+        task = self.loop.create_task(request_handler(
             self.mapping, stream, headers, self.codec,
             self.status_details_codec, self.dispatch, release_stream,
+            self.close_event,
         ))
+        self._tasks[stream] = task
 
     def cancel(self, stream: 'protocol.Stream') -> None:
         task = self._tasks.pop(stream)
         task.cancel()
         self._cancelled.add(task)
 
-    def close(self) -> None:
+    def close(self, force = False) -> None:
         for task in self._tasks.values():
             task.cancel()
         self._cancelled.update(self._tasks.values())
         self.closing = True
+        self.close_event.set()
+        if self.connection is not None and force:
+            self.connection.close()
 
     async def wait_closed(self) -> None:
         if self._cancelled:
@@ -717,7 +738,7 @@ class Server(_GC):
             )
         self._server_closed_fut = self._loop.create_future()
 
-    def close(self) -> None:
+    def close(self, graceful: bool = False) -> None:
         """Stops accepting new connections, cancels all currently running
         requests. Request handlers are able to handle `CancelledError` and
         exit properly.
@@ -728,15 +749,22 @@ class Server(_GC):
         if not self._server_closed_fut.done():
             self._server_closed_fut.set_result(None)
         for handler in self._handlers:
-            handler.close()
+            handler.close(force=not graceful)
 
-    async def wait_closed(self) -> None:
+
+    async def wait_closed(self, grace_s: float | None = None) -> None:
         """Coroutine to wait until all existing request handlers will exit
         properly.
         """
         if self._server is None or self._server_closed_fut is None:
             raise RuntimeError('Server is not started')
         await self._server_closed_fut
+        if grace_s is not None and grace_s > 0:
+            done, pending = await asyncio.wait([self._loop.create_task(self._server.wait_closed())], timeout=grace_s)
+            if len(pending) != 0:
+                # we're done waiting for the handlers; kill them
+                for handler in self._handlers:
+                    handler.close(force=True)
         await self._server.wait_closed()
         if self._handlers:
             await asyncio.wait({

@@ -485,8 +485,9 @@ class Stream:
             return False
         return not stream.closed
 
-
 class AbstractHandler(ABC):
+
+    connection: H2Connection | None = None
 
     @abstractmethod
     def accept(
@@ -708,6 +709,7 @@ class H2Protocol(Protocol):
         )
         self.connection.flush()
         self.connection.initialize()
+        self.handler.connection = self.connection
 
         self.processor = EventsProcessor(self.handler, self.connection)
 
