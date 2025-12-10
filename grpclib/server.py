@@ -3,6 +3,7 @@ import time
 import socket
 import logging
 import asyncio
+import traceback
 import warnings
 
 from types import TracebackType
@@ -315,7 +316,7 @@ class Stream(StreamIterator[_RecvType], Generic[_RecvType, _SendType]):
                 status_details = exc_val.details
             elif isinstance(exc_val, Exception):
                 status = Status.UNKNOWN
-                status_message = 'Internal Server Error'
+                status_message = f'{str(exc_val)}: {traceback.format_exception(exc_val)}'
                 status_details = None
             elif isinstance(exc_val, asyncio.CancelledError):
                 status = Status.CANCELLED
